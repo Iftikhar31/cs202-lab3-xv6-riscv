@@ -124,6 +124,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->threadid=0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -158,8 +159,13 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  if(p->threadid==0){
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  }
+  else{
+    uvmunmap(p->pagetable, TRAPFRAME - PGSIZE * (p->threadid), 1, 0);
+  }
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -351,6 +357,7 @@ exit(int status)
   if(p == initproc)
     panic("init exiting");
 
+  if(p->threadid == 0){
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd]){
@@ -358,6 +365,7 @@ exit(int status)
       fileclose(f);
       p->ofile[fd] = 0;
     }
+  }
   }
 
   begin_op();
@@ -680,4 +688,98 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+static struct proc*
+allocproc_thread()
+{
+  struct proc *t;
+  int threadn;
+  struct proc* p = myproc();
+  acquire(&p->lock);
+  p->numThreads++;
+  threadn=p->numThreads;
+  release(&p->lock);
+
+  for(t = proc; t < &proc[NPROC]; t++) {
+    acquire(&t->lock);
+    if(t->state == UNUSED) {
+      goto found;
+    } else {
+      release(&t->lock);
+    }
+  }
+  return 0;
+
+found:
+  t->pid = allocpid();
+  t->threadid = threadn;
+  t->state = USED;
+ 
+
+  // Allocate a trapframe page.
+  if((t->trapframe = (struct trapframe *)kalloc()) == 0){
+    freeproc(t);
+    release(&t->lock);
+    return 0;
+  }
+
+  // An empty user page table.
+  if(mappages(p->pagetable, TRAPFRAME - PGSIZE * t->threadid, PGSIZE,
+              (uint64)(t->trapframe), PTE_R | PTE_W) < 0){
+    uvmunmap(p->pagetable, TRAPFRAME - PGSIZE * (t->threadid), 1, 0);
+    return 0;
+  }
+
+  // Set up new context to start executing at forkret,
+  // which returns to user space.
+  memset(&t->context, 0, sizeof(t->context));
+  t->context.ra = (uint64)forkret;
+  t->context.sp = t->kstack + PGSIZE;
+
+  return t;
+}
+int clone(void * a){
+  int i, tid;
+  struct proc *np;
+  struct proc *p = myproc();
+
+  // Allocate process.
+  if((np = allocproc_thread()) == 0){
+    return -1;
+  }
+ 
+
+  // Copy user memory from parent to child.
+  np->sz = p->sz;
+
+  // copy saved user registers.
+  *(np->trapframe) = *(p->trapframe);
+  np->pagetable=p->pagetable;
+  np->trapframe->sp=(uint64)a+PGSIZE;
+
+  // Cause clone to return 0 in the child.
+  np->trapframe->a0 = 0;
+
+  // increment reference counts on open file descriptors.
+  for(i = 0; i < NOFILE; i++)
+    if(p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+
+  tid = p->numThreads;
+
+  release(&np->lock);
+
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return tid;
 }
